@@ -1680,6 +1680,11 @@ from gateway.delivery import DeliveryRouter, looks_like_telegram_private_chat_id
 from gateway.authz_mixin import GatewayAuthorizationMixin
 from gateway.kanban_watchers import GatewayKanbanWatchersMixin
 from gateway.slash_commands import GatewaySlashCommandsMixin
+from gateway.chat_routing import (
+    build_exegesis_followup_kanban_task,
+    build_exegesis_followup_kanban_pair,
+    route_exegesis_topic_message,
+)
 from gateway.platforms.base import (
     BasePlatformAdapter,
     EphemeralReply,
@@ -7383,6 +7388,129 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         except Exception:
             return "default"
 
+    async def _maybe_handle_exegesis_topic4_handoff(
+        self,
+        *,
+        event: MessageEvent,
+        source: SessionSource,
+    ) -> Optional[str]:
+        """Create a durable vgm-exegesis Kanban card before the LLM sees T4 follow-ups.
+
+        P3-1.4: Gloria's topic-4 exegesis follow-ups must become durable
+        Kanban handoffs at gateway ingress. This keeps route-only requests such
+        as ``ruta 2 y 3`` out of the chachita LLM turn and carries
+        ``delivery_mode`` plus source-topic metadata into the worker contract.
+        """
+        if bool(getattr(event, "internal", False)):
+            return None
+        if getattr(event, "message_type", None) != MessageType.TEXT:
+            return None
+        if event.get_command():
+            return None
+
+        msg = {
+            "platform": source.platform.value if hasattr(source.platform, "value") else str(source.platform),
+            "chat_id": str(source.chat_id or ""),
+            "thread_id": source.thread_id,
+            "message_id": getattr(event, "message_id", None) or getattr(source, "message_id", None) or "",
+            "text": event.text or "",
+            "profile": self._active_profile_name(),
+            "user_id": source.user_id,
+            "user_name": source.user_name,
+        }
+
+        try:
+            decision = route_exegesis_topic_message(msg)
+        except Exception as exc:
+            logger.warning("VGM topic-4 routing decision failed; falling through to normal path: %s", exc)
+            return None
+
+        if decision.get("action") != "route_to_vgm_exegesis":
+            return None
+
+        try:
+            profile_config = _load_gateway_config()
+
+            # Feature flag: vgm.exegesis_routing (single_task | build_deliver_pair)
+            vgm_cfg = profile_config.get("vgm", {}) if isinstance(profile_config, dict) else {}
+            routing_mode = vgm_cfg.get("exegesis_routing", "single_task")
+
+            if routing_mode == "build_deliver_pair":
+                # BUILD+DELIVER pair path — two tasks, DELIVER depends on BUILD
+                pair = build_exegesis_followup_kanban_pair(
+                    msg,
+                    profile_config=profile_config if isinstance(profile_config, dict) else None,
+                )
+                build_payload, deliver_payload = pair
+
+                def _create_pair() -> tuple[str, str]:
+                    from hermes_cli import kanban_db
+
+                    board = build_payload.get("board")
+                    conn = kanban_db.connect(board=board)
+                    try:
+                        build_id = kanban_db.create_task(conn, **build_payload)
+                        # Set DELIVER's parents to the actual BUILD task_id
+                        deliver_payload["parents"] = [build_id]
+                        deliver_id = kanban_db.create_task(conn, **deliver_payload)
+                        return build_id, deliver_id
+                    finally:
+                        try:
+                            conn.close()
+                        except Exception:
+                            pass
+
+                build_id, deliver_id = await asyncio.to_thread(_create_pair)
+                logger.info(
+                    "VGM topic-4 pre-LLM handoff created BUILD task %s + DELIVER task %s "
+                    "delivery_mode=%s target=%s",
+                    build_id,
+                    deliver_id,
+                    decision.get("delivery_mode"),
+                    decision.get("target_delivery"),
+                )
+                return (
+                    "Dame un momento, Gloris — ya lo estoy preparando 🙏\n\n"
+                    "Ya lo puse a trabajar con el equipo de exégesis. "
+                    "Te lo mando aquí cuando esté listo."
+                )
+            else:
+                # Original single-task path (default when flag is single_task or absent)
+                payload = build_exegesis_followup_kanban_task(
+                    msg,
+                    profile_config=profile_config if isinstance(profile_config, dict) else None,
+                )
+
+                def _create_task() -> str:
+                    from hermes_cli import kanban_db
+
+                    board = payload.get("board")
+                    conn = kanban_db.connect(board=board)
+                    try:
+                        return kanban_db.create_task(conn, **payload)
+                    finally:
+                        try:
+                            conn.close()
+                        except Exception:
+                            pass
+
+                task_id = await asyncio.to_thread(_create_task)
+                logger.info(
+                    "VGM topic-4 pre-LLM handoff created Kanban task %s "
+                    "delivery_mode=%s target=%s",
+                    task_id,
+                    decision.get("delivery_mode"),
+                    decision.get("target_delivery"),
+                )
+                return (
+                    "Dame un momento, Gloris — ya lo estoy preparando 🙏\n\n"
+                    "Ya lo puse a trabajar con el equipo de exégesis. "
+                    "Te lo mando aquí cuando esté listo."
+                )
+        except Exception as exc:
+            logger.exception("VGM topic-4 pre-LLM Kanban handoff failed: %s", exc)
+            return "Estoy teniendo un problema técnico. Ya le avisé a Sergio."
+
     # ── Kanban board watchers ───────────────────────────────────────────
     # The kanban notifier/dispatcher watcher loops + their helpers live in
     # GatewayKanbanWatchersMixin (gateway/kanban_watchers.py). They use only
@@ -9691,6 +9819,13 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 "please resend shortly."
             )
 
+        _topic4_handoff = await self._maybe_handle_exegesis_topic4_handoff(
+            event=event,
+            source=source,
+        )
+        if _topic4_handoff is not None:
+            return _topic4_handoff
+
         # ── Claim this session before any await ───────────────────────
         # Between here and _run_agent registering the real AIAgent, there
         # are numerous await points (hooks, vision enrichment, STT,
@@ -10887,6 +11022,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 "thread_id": str(getattr(source, "thread_id", None)) if getattr(source, "thread_id", None) else "",
                 "chat_type": getattr(source, "chat_type", "") or "",
                 "session_id": session_entry.session_id,
+                "message_id": getattr(source, "message_id", None) or "",
                 "message": message_text[:500],
             }
             await self.hooks.emit("agent:start", hook_ctx)

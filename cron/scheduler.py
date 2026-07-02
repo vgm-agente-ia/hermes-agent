@@ -1217,6 +1217,155 @@ def _confirm_adapter_delivery(send_result) -> bool:
     return bool(getattr(send_result, "success"))
 
 
+
+def _artifact_validation_config(job: dict) -> dict:
+    """Return enabled artifact validation config for a cron job, if present."""
+    cfg = job.get("artifact_validation")
+    if not isinstance(cfg, dict) or not cfg.get("enabled"):
+        return {}
+    return cfg
+
+
+def _render_artifact_validation_path(template: str, artifact_date: str) -> Path:
+    """Render a validation path template using the resolved artifact date."""
+    return Path(str(template).format(date=artifact_date)).expanduser()
+
+
+def _resolve_artifact_validation_date(cfg: dict) -> str:
+    """Resolve the artifact date for a validation run."""
+    explicit = str(cfg.get("date") or "").strip()
+    if explicit:
+        return explicit
+    tz_name = str(cfg.get("date_tz") or "UTC").strip() or "UTC"
+    try:
+        from zoneinfo import ZoneInfo
+        current = _hermes_now().astimezone(ZoneInfo(tz_name))
+    except Exception:
+        current = _hermes_now()
+    return current.strftime(str(cfg.get("date_format") or "%Y-%m-%d"))
+
+
+def _sanitize_validation_text(text: str, limit: int = 4000) -> str:
+    """Redact obvious credential shapes before writing/sending validation summaries."""
+    import re
+
+    sanitized = str(text or "")
+    patterns = [
+        (r"(?i)(token|api[_-]?key|secret|password|authorization|bearer)\s*[:=]\s*\S+", r"=[REDACTED]"),
+        (r"\d{8,10}:[A-Za-z0-9_-]{30,}", "[REDACTED_TELEGRAM_BOT_TOKEN]"),
+        (r"[A-Za-z0-9_-]{48,}", "[REDACTED_LONG_TOKEN]"),
+    ]
+    for pattern, repl in patterns:
+        sanitized = re.sub(pattern, repl, sanitized)
+    if len(sanitized) > limit:
+        sanitized = sanitized[:limit].rstrip() + "\n… [truncated]"
+    return sanitized
+
+
+def _run_artifact_validation_before_delivery(job: dict, output_file: Path) -> Optional[dict]:
+    """Run a configured artifact validator before cron delivery.
+
+    Returns None when validation is disabled or passes. Returns a sanitized
+    failure dict when delivery must be blocked and the operator notified.
+    """
+    cfg = _artifact_validation_config(job)
+    if not cfg:
+        return None
+
+    artifact_date = _resolve_artifact_validation_date(cfg)
+    validator_template = cfg.get("validator")
+    markdown_template = cfg.get("markdown")
+    json_template = cfg.get("json") or cfg.get("manifest")
+    if not validator_template or not markdown_template or not json_template:
+        reason = "artifact_validation is enabled but validator/markdown/json path is incomplete"
+        stdout = ""
+        stderr = reason
+        returncode = 2
+        validator_path = markdown_path = json_path = None
+    else:
+        validator_path = _render_artifact_validation_path(validator_template, artifact_date)
+        markdown_path = _render_artifact_validation_path(markdown_template, artifact_date)
+        json_path = _render_artifact_validation_path(json_template, artifact_date)
+        missing = [str(p) for p in (validator_path, markdown_path, json_path) if not p.exists()]
+        if missing:
+            stdout = ""
+            stderr = "Missing validation input(s): " + "; ".join(missing)
+            returncode = 2
+        else:
+            cmd = [
+                sys.executable,
+                str(validator_path),
+                "--markdown",
+                str(markdown_path),
+                "--json",
+                str(json_path),
+            ]
+            try:
+                proc = subprocess.run(
+                    cmd,
+                    text=True,
+                    capture_output=True,
+                    timeout=int(cfg.get("timeout_seconds") or 60),
+                )
+                stdout = proc.stdout or ""
+                stderr = proc.stderr or ""
+                returncode = proc.returncode
+            except Exception as exc:
+                stdout = ""
+                stderr = f"{type(exc).__name__}: {exc}"
+                returncode = 2
+
+    if returncode == 0:
+        logger.info("Job '%s': artifact validation passed for %s", job.get("id", "?"), artifact_date)
+        return None
+
+    combined = _sanitize_validation_text((stdout + "\n" + stderr).strip(), limit=6000)
+    summary_lines = [line for line in combined.splitlines() if line.strip()][:18]
+    summary = "\n".join(summary_lines) or "Validator failed without output."
+
+    log_dir_template = cfg.get("failure_log_dir") or str(_get_hermes_home() / "cron" / "validation-failures")
+    log_dir = _render_artifact_validation_path(log_dir_template, artifact_date)
+    log_dir.mkdir(parents=True, exist_ok=True)
+    log_path = log_dir / f"{job.get('id', 'job')}-{artifact_date}-{_hermes_now().strftime('%Y%m%d-%H%M%S')}.log"
+    log_body = (
+        f"VGM exegesis artifact validation failure\n"
+        f"time={_hermes_now().isoformat()}\n"
+        f"job_id={job.get('id', '')}\n"
+        f"job_name={job.get('name', '')}\n"
+        f"artifact_date={artifact_date}\n"
+        f"validator={validator_path}\n"
+        f"markdown={markdown_path}\n"
+        f"json={json_path}\n"
+        f"cron_output={output_file}\n"
+        f"returncode={returncode}\n\n"
+        f"--- validator output ---\n{combined}\n"
+    )
+    log_path.write_text(log_body, encoding="utf-8")
+    try:
+        os.chmod(log_path, 0o600)
+    except OSError:
+        pass
+
+    artifact_display = str(markdown_path) if markdown_path is not None else "unresolved"
+    manifest_display = str(json_path) if json_path is not None else "unresolved"
+    operator_message = (
+        "⚠️ VGM exegesis validation blocked Telegram delivery\n\n"
+        f"Date: {artifact_date}\n"
+        f"Job: {job.get('name', job.get('id', 'unknown'))}\n"
+        f"Artifact: {artifact_display}\n"
+        f"Manifest: {manifest_display}\n"
+        f"Failure log: {log_path}\n\n"
+        "Summary:\n"
+        f"{summary}"
+    )
+    return {
+        "error": f"artifact validation failed for {artifact_date}; delivery blocked; log={log_path}",
+        "operator_message": operator_message,
+        "operator_deliver": str(cfg.get("operator_deliver") or "origin"),
+        "log_path": str(log_path),
+    }
+
+
 def _deliver_result(job: dict, content: str, adapters=None, loop=None) -> Optional[str]:
     """
     Deliver job output to the configured target(s) (origin chat, specific platform, etc.).
@@ -2261,6 +2410,31 @@ def run_job(job: dict) -> tuple[bool, str, str, Optional[str]]:
     job_name = str(job.get("name") or job.get("prompt") or job_id or "cron job")
 
     # ---------------------------------------------------------------
+    # Execution guard — verify the active profile matches the job's
+    # expected_profile before running. Prevents cross-profile execution
+    # (e.g. a vgm-exegesis job fired by the root profile ticker).
+    #
+    # Local workaround for #53077 (no_agent cron jobs ignore job's profile
+    # — script resolves under ticking gateway's HERMES_HOME). When upstream
+    # ships profile scoping for no_agent (likely via contextvars hoist above
+    # the no_agent short-circuit), this guard can be removed.
+    # ---------------------------------------------------------------
+    guard_cfg = job.get("execution_guard", {})
+    if isinstance(guard_cfg, dict) and guard_cfg.get("enabled"):
+        expected = str(guard_cfg.get("expected_profile") or "").strip()
+        if expected:
+            try:
+                current_profile = str(os.environ.get("HERMES_PROFILE") or "").strip()
+                if not current_profile:
+                    current_profile = str(_get_hermes_home().name or "").strip()
+            except Exception:
+                current_profile = ""
+            if expected and current_profile and expected != current_profile:
+                error = f"execution_guard: expected profile '{expected}', got '{current_profile}'"
+                logger.error("Job '%s': %s", job_id, error)
+                return False, "", "", error
+
+    # ---------------------------------------------------------------
     # no_agent short-circuit — the script IS the job, no LLM involvement.
     # ---------------------------------------------------------------
     # This mirrors the classic "run a bash script on a timer, send its
@@ -3135,6 +3309,24 @@ def run_one_job(job: dict, *, adapters=None, loop=None, verbose: bool = False) -
         if should_deliver and success and _is_cron_silence_response(deliver_content):
             logger.info("Job '%s': agent returned %s — skipping delivery", job["id"], SILENT_MARKER)
             should_deliver = False
+
+        # Artifact validation gate — runs before delivery, blocks on failure
+        # and routes to operator target instead of normal recipient.
+        validation_failure = None
+        if success and final_response.strip():
+            validation_failure = _run_artifact_validation_before_delivery(job, output_file)
+            if validation_failure:
+                success = False
+                error = validation_failure["error"]
+                logger.warning("Job '%s': %s", job["id"], error)
+
+        validation_cfg = _artifact_validation_config(job)
+        if validation_failure:
+            deliver_content = validation_failure["operator_message"]
+            should_deliver = True
+        elif not success and validation_cfg:
+            deliver_content = f"⚠️ Cron job '{job.get('name', job['id'])}' failed before delivery:\n{error}"
+            should_deliver = True
 
         delivery_error = None
         if should_deliver:
