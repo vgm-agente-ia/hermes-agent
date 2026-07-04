@@ -7453,6 +7453,33 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                         # Set DELIVER's parents to the actual BUILD task_id
                         deliver_payload["parents"] = [build_id]
                         deliver_id = kanban_db.create_task(conn, **deliver_payload)
+
+                        # This pre-LLM handoff uses direct kanban_db.create_task
+                        # calls, so it bypasses both /kanban-create and
+                        # kanban_create-tool auto-subscribe hooks. Subscribe the
+                        # originating topic explicitly so DELIVER completion
+                        # artifacts are sent back through the owning gateway.
+                        platform = str(msg.get("platform") or "").lower()
+                        chat_id = str(msg.get("chat_id") or "")
+                        thread_raw = msg.get("thread_id")
+                        thread_id = str(thread_raw) if thread_raw is not None else None
+                        user_raw = msg.get("user_id")
+                        user_id = str(user_raw) if user_raw else None
+                        notifier_profile = (
+                            getattr(self, "_kanban_notifier_profile", None)
+                            or str(msg.get("profile") or self._active_profile_name() or "")
+                        )
+                        if platform and chat_id:
+                            kanban_db.add_notify_sub(
+                                conn,
+                                task_id=deliver_id,
+                                platform=platform,
+                                chat_id=chat_id,
+                                thread_id=thread_id,
+                                user_id=user_id,
+                                notifier_profile=notifier_profile or None,
+                            )
+
                         return build_id, deliver_id
                     finally:
                         try:

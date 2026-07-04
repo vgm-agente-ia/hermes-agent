@@ -11,6 +11,7 @@ before the chachita LLM sees Gloria's topic-4 exegesis follow-up:
 from __future__ import annotations
 
 import ast
+import asyncio
 import importlib
 import inspect
 import sys
@@ -156,3 +157,89 @@ def test_gateway_handoff_helper_has_no_agent_or_delegate_dependency():
         assert token not in helper_source
 
     assert "kanban_db.create_task" in helper_source or ".create_task(" in helper_source
+
+
+def test_build_deliver_pair_handoff_subscribes_originating_telegram_topic(
+    monkeypatch,
+    tmp_path,
+):
+    """Gateway-created DELIVER tasks must have a notifier subscription.
+
+    The topic-4 deterministic handoff writes BUILD+DELIVER tasks with direct
+    ``kanban_db.create_task(...)`` calls, so it does not pass through either
+    gateway slash-command auto-subscribe or the model-tool auto-subscribe hook.
+    The handler itself must therefore subscribe the originating Telegram topic
+    to the DELIVER task, or completion artifacts will never be sent.
+    """
+    from gateway.config import Platform
+    from gateway.platforms.base import MessageEvent, MessageType
+    from gateway.run import GatewayRunner
+    from gateway.session import SessionSource
+    from hermes_cli import kanban_db
+    import gateway.run as run_mod
+
+    monkeypatch.setenv("HERMES_KANBAN_HOME", str(tmp_path / "hermes-home"))
+    monkeypatch.delenv("HERMES_KANBAN_DB", raising=False)
+    monkeypatch.delenv("HERMES_KANBAN_BOARD", raising=False)
+    monkeypatch.setattr(
+        run_mod,
+        "_load_gateway_config",
+        lambda: {
+            "vgm": {"exegesis_routing": "build_deliver_pair"},
+            "kanban": {"default_board": "vgm"},
+        },
+    )
+    monkeypatch.setattr(
+        GatewayRunner,
+        "_active_profile_name",
+        lambda self: "vgm-chachita",
+    )
+
+    source = SessionSource(
+        platform=Platform.TELEGRAM,
+        chat_id="-1003826944617",
+        chat_type="group",
+        thread_id="4",
+        user_id="gloria-user-id",
+        user_name="Gloria",
+        message_id="3342",
+        profile="vgm-chachita",
+    )
+    event = MessageEvent(
+        text="La ruta 1",
+        message_type=MessageType.TEXT,
+        source=source,
+        message_id="3342",
+    )
+    runner = object.__new__(GatewayRunner)
+
+    ack = asyncio.run(
+        runner._maybe_handle_exegesis_topic4_handoff(
+            event=event,
+            source=source,
+        )
+    )
+
+    assert ack and "Te lo mando aquí" in ack
+
+    conn = kanban_db.connect(board="vgm")
+    try:
+        tasks = conn.execute(
+            "SELECT id, title FROM tasks ORDER BY created_at, id"
+        ).fetchall()
+        deliver_ids = [
+            row["id"]
+            for row in tasks
+            if "DELIVER" in row["title"]
+        ]
+        assert len(deliver_ids) == 1
+
+        subs = kanban_db.list_notify_subs(conn, deliver_ids[0])
+        assert subs, "DELIVER task must be subscribed for gateway delivery"
+        assert subs[0]["platform"] == "telegram"
+        assert subs[0]["chat_id"] == "-1003826944617"
+        assert subs[0]["thread_id"] == "4"
+        assert subs[0]["user_id"] == "gloria-user-id"
+        assert subs[0]["notifier_profile"] == "vgm-chachita"
+    finally:
+        conn.close()
