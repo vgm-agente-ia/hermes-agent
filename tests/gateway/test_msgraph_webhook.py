@@ -500,3 +500,60 @@ class TestMSGraphSourceIPAllowlist:
         """Env-var-style 'cidr1, cidr2' strings parse as a list."""
         adapter = _make_adapter(allowed_source_cidrs="10.0.0.0/8, 203.0.113.0/24")
         assert len(adapter._allowed_source_networks) == 2
+
+
+class TestMSGraphRealNotificationResourceShape:
+    """Regression coverage for a real mailbox-subscription notification.
+
+    Graph notifications use ``Users/{user-id}/Messages/{message-id}``, not the
+    mailbox-folder resource used while creating the subscription.
+    """
+
+    USER_ID = "7f81fd5f-d24a-4b1a-82aa-14325fb8acad"
+    REAL_RESOURCE = f"Users/{USER_ID}/Messages/msg-1"
+
+    def _real_payload(self, resource: str) -> dict:
+        return {
+            "value": [
+                {
+                    "id": "b036c27f-fe91-4457-bb0e-1e34d349e593",
+                    "subscriptionId": "c01f716c-3f26-49ae-9227-c4ed40aaa939",
+                    "changeType": "created",
+                    "resource": resource,
+                    "clientState": "expected-client-state",
+                    "resourceData": {
+                        "@odata.type": "#Microsoft.Graph.Message",
+                        "@odata.id": self.REAL_RESOURCE,
+                        "id": "msg-1",
+                    },
+                }
+            ]
+        }
+
+    @pytest.mark.anyio
+    async def test_userid_prefix_pattern_accepts_real_notification(self):
+        adapter = _make_adapter(accepted_resources=[f"Users/{self.USER_ID}/"])
+        resp = await adapter._handle_notification(
+            _FakeRequest(json_payload=self._real_payload(self.REAL_RESOURCE))
+        )
+        assert resp.status == 202
+
+    @pytest.mark.anyio
+    async def test_old_mailfolder_pattern_rejects_real_notification(self):
+        adapter = _make_adapter(
+            accepted_resources=[
+                f"users/{self.USER_ID}/mailFolders('inbox')/messages"
+            ]
+        )
+        resp = await adapter._handle_notification(
+            _FakeRequest(json_payload=self._real_payload(self.REAL_RESOURCE))
+        )
+        assert resp.status == 400
+
+    @pytest.mark.anyio
+    async def test_resource_matching_is_case_sensitive(self):
+        adapter = _make_adapter(accepted_resources=[f"users/{self.USER_ID}/"])
+        resp = await adapter._handle_notification(
+            _FakeRequest(json_payload=self._real_payload(self.REAL_RESOURCE))
+        )
+        assert resp.status == 400
